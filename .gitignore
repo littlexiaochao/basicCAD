@@ -1,0 +1,13 @@
+# 依赖
+node_modules/
+
+# 构建产物
+dist/
+
+# macOS
+.DS_Store
+
+# 日志与临时文件
+*.log
+.vite/
+*.local

@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="icon" href="data:," />
+  <title>basicCAD</title>
+</head>
+<body>
+  <div id="app">
+    <!-- 顶部工具栏 -->
+    <header class="toolbar">
+      <div class="logo">
+        <span class="logo-mark">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <path d="M12 2 L22 7 L12 12 L2 7 Z" />
+            <path d="M2 17 L12 22 L22 17" />
+            <path d="M2 7 L12 12 L22 7" opacity="0.55" />
+            <path d="M12 12 L12 22" opacity="0.55" />
+          </svg>
+        </span>
+        <span class="logo-text">basicCAD</span>
+      </div>
+
+      <span class="model-name" id="model-name"></span>
+
+      <div class="toolbar-spacer"></div>
+
+      <label id="btn-open" class="tool-btn primary" for="file-input" role="button" tabindex="0" title="导入 OBJ / STL / STEP 格式的 3D 模型">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 3v12" /><path d="m8 11 4 4 4-4" /><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" />
+        </svg>
+        导入模型
+      </label>
+      <input type="file" id="file-input" accept=".obj,.stl,.step,.stp" hidden />
+
+      <div class="dropdown" id="shading-dropdown">
+        <button id="btn-shading" class="tool-btn" title="切换着色模式（可叠加）">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2 2 7l10 5 10-5-10-5Z" /><path d="m2 17 10 5 10-5" /><path d="m2 12 10 5 10-5" />
+          </svg>
+          着色模式
+          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m6 9 6 6 6-6" /></svg>
+        </button>
+        <div class="dropdown-menu" id="shading-menu">
+          <!-- <label class="menu-check">
+            <input type="checkbox" checked disabled />
+            <span>默认显示模式</span>
+          </label> -->
+          <label class="menu-check">
+            <input type="checkbox" id="opt-edges" />
+            <span>网格显示</span>
+          </label>
+          <label class="menu-check">
+            <input type="checkbox" id="opt-flat" title="启用平面光照着色（flat shading）" />
+            <span>平坦着色</span>
+          </label>
+          <label class="menu-check">
+            <input type="checkbox" id="opt-normal" title="按法线方向着色（normal shading）" />
+            <span>法线着色</span>
+          </label>
+          <label class="menu-check">
+            <input type="checkbox" id="opt-env" checked title="使用环境贴图反射着色" />
+            <span>环境贴图着色</span>
+          </label>
+          <div class="env-box" id="env-box" hidden>
+            <div class="env-list" id="env-list">
+              <div class="env-list-tip">正在加载环境贴图…</div>
+            </div>
+            <label class="menu-check">
+              <input type="checkbox" id="opt-env-bg" title="显示环境背景（不影响模型着色）" />
+              <span>显示环境背景</span>
+            </label>
+            <div class="menu-slider">
+              <span>环境反射</span>
+              <input type="range" id="opt-env-strength" min="0" max="100" value="50" title="调节环境贴图对模型的影响，100≈金属全反射" />
+              <span class="menu-slider-val" id="opt-env-strength-val">50</span>
+            </div>
+          </div>
+          <div class="menu-color">
+            <span>固有色</span>
+            <input type="color" id="opt-color" value="#ffffff" title="点击选择模型固有色" />
+          </div>
+          <div class="menu-backface">
+            <span>反面</span>
+            <select id="opt-backface-mode" title="反面着色方式">
+              <option value="solid" selected>单色</option>
+              <option value="front">正面着色</option>
+            </select>
+            <input type="color" id="opt-backface-color" value="#d8d2aa" title="反面单色（选择「单色」时生效）" />
+          </div>
+          <div class="menu-slider">
+            <span>高光</span>
+            <input type="range" id="opt-specular" min="0" max="100" value="15" title="调节高光强度，低=漫反射，高=强高光" />
+            <span class="menu-slider-val" id="opt-specular-val">15</span>
+          </div>
+        </div>
+      </div>
+
+      <button id="btn-clear" class="tool-btn" title="清除已加载的模型">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 6h18" /><path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2" /><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" /><path d="M10 11v6" /><path d="M14 11v6" />
+        </svg>
+        清除
+      </button>
+    </header>
+
+    <!-- 3D 视口 -->
+    <main class="viewport" id="viewport">
+      <aside class="info-panel" id="info-panel" hidden>
+        <div class="info-title">模型信息</div>
+        <div class="info-row"><span>顶点数</span><strong id="info-vertices">—</strong></div>
+        <div class="info-row"><span>网格面数</span><strong id="info-faces">—</strong></div>
+      </aside>
+
+      <div class="view-cube" id="view-cube">
+        <div class="view-cube-canvas" id="view-cube-canvas"></div>
+        <div class="view-cube-actions">
+          <button id="btn-projection" class="view-cube-reset" title="切换透视 / 正交投影">正交</button>
+          <button id="btn-view-reset" class="view-cube-reset" title="复位为等轴测视角">复位</button>
+        </div>
+      </div>
+
+      <div class="gizmo-panel" id="gizmo-panel">
+        <button id="btn-gizmo" class="gizmo-toggle" title="点击展开/收起操作轴模式">
+          <span>操作轴</span>
+          <svg class="chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m6 9 6 6 6-6" /></svg>
+        </button>
+        <button id="btn-grid" class="gizmo-toggle active" title="显示/隐藏格线">格线</button>
+        <div class="gizmo-modes" id="gizmo-modes" hidden>
+          <button class="gizmo-mode-btn active" data-mode="translate">移动</button>
+          <button class="gizmo-mode-btn" data-mode="rotate">旋转</button>
+          <button class="gizmo-mode-btn" data-mode="scale">缩放</button>
+          <button id="btn-center-origin" class="gizmo-action-btn" title="将模型包围盒中心移动到世界原点 (0,0,0)">移到原点</button>
+        </div>
+        <div class="axis-input" id="axis-input" hidden>
+          <span id="axis-input-label">X 轴平移</span>
+          <input id="axis-input-value" type="number" step="any" placeholder="数值" />
+        </div>
+      </div>
+
+      <div class="empty-hint" id="empty-hint">点击右上角「导入模型」，或将 OBJ / STL / STEP 文件拖拽到此处</div>
+      <div class="viewport-overlay" id="loading-overlay" hidden>
+        <div class="spinner"></div>
+        <span id="loading-text">加载中…</span>
+      </div>
+      <div class="control-hint">左键旋转 · 右键平移 · 滚轮缩放</div>
+    </main>
+  </div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
