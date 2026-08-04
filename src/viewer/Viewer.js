@@ -9,6 +9,25 @@ import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import { EXRLoader } from 'three/addons/loaders/EXRLoader.js';
 // OpenCASCADE 的 WASM 版本（用于解析 STEP / STP CAD 模型）
 import occtWasmUrl from 'occt-import-js/dist/occt-import-js.wasm?url';
+// Manifold 3D 的 WASM（用于 SDF 等值面提取与后续布尔运算）
+import manifoldWasmUrl from 'manifold-3d/manifold.wasm?url';
+import {
+  setManifoldLocateFile,
+  meshToSDF,
+  sdfToThreeMesh,
+  filterSmallComponents,
+  analyzeRootClosedness,
+  warmSplatWorkers,
+} from '../sdf/implicit.js';
+// Dual Contouring（Hermite 数据 + QEF）等值面提取：保留锐边、无需 WASM
+import { sdfToDualContourMesh } from '../sdf/dualContour.js';
+// 隐式表面网格导出（STL / OBJ）
+import { geometryToBinarySTL, geometryToASCIISTL, geometryToOBJ } from '../sdf/meshExport.js';
+// 免网格体绘制（GPU 光线步进直接渲染 SDF）
+import { createImplicitVolume } from './implicitVolume.js';
+
+// 告诉隐式表示模块去哪里加载 Manifold WASM（Vite 打包为资产 URL）
+setManifoldLocateFile(() => manifoldWasmUrl);
 
 /** occt-import-js 懒初始化（首次导入 STEP 时才加载 WASM） */
 let _occtPromise = null;
@@ -50,6 +69,9 @@ const ENV_ROTATION = new THREE.Euler(THREE.MathUtils.degToRad(90), 0, 0);
 
 /** 无环境背景时的默认场景底色 */
 const DEFAULT_SCENE_BG = new THREE.Color(0x16181d);
+
+/** 恒等矩阵（用于判断网格是否被操作轴变换过） */
+const _IDENTITY_MATRIX = new THREE.Matrix4();
 
 /**
  * 创建带彩色中心线的网格（CAD 坐标：Z 向上，格线在 XY 平面）：
@@ -336,6 +358,39 @@ export class Viewer {
     this.scene.add(this.modelGroup);
     this.modelName = '';
     this.modelBox = null;
+    this.modelClosedness = null;
+
+    // ---------- 隐式表示（SDF）容器 ----------
+    this.implicitGroup = new THREE.Group();
+    this.scene.add(this.implicitGroup);
+    this.implicitGroup.visible = false;
+    this.implicitModel = null;
+    this._convertToken = 0;
+    this._convertAbort = null;
+    this._extractToken = 0;
+    /**
+     * 数据流：当前显示的数据阶段。
+     * 'model'=原模型（导入网格）| 'implicit'=隐式表示（免网格体绘制）| 'mesh'=网格化结果
+     */
+    this.activeStage = 'model';
+    this.hasImplicit = false;
+    this.hasMesh = false;
+    this._implicitVolume = null;
+    /** 环境贴图反射方向旋转（与网格材质 envMapRotation 一致） */
+    this._envRotationMatrix = new THREE.Matrix3().setFromMatrix4(
+      new THREE.Matrix4().makeRotationFromEuler(ENV_ROTATION)
+    );
+    this._fallbackEnvTex = null;
+    /** 网格化精度：提取密度倍数 = 该值 × SDF 格距（1~3，越小越精细；实时影响免网格预览步长，网格化时作为提取密度） */
+    this.meshPrecision = 1;
+    /** 等值面提取方式：'dc'=Dual Contouring（默认，保留锐边）/ 'manifold'=Manifold level set */
+    this.extractMethod = 'dc';
+    /** 隐式转换完成后的回调：onImplicitCreated(info) */
+    this.onImplicitCreated = null;
+    /** 网格化完成后的回调：onMeshCreated(info) */
+    this.onMeshCreated = null;
+    /** 数据流阶段切换回调：onDataStageChange(stage) */
+    this.onDataStageChange = null;
     /** 着色叠加选项：edges / flat / normal / env（环境贴图着色）/ envType */
     this.shadingOptions = {
       edges: false,
@@ -602,7 +657,8 @@ export class Viewer {
 
   /** 点击画布：命中模型则显示操作轴；空白处点击不改变操作轴状态 */
   _handleCanvasClick(e) {
-    if (!this.gizmoEnabled || this.transformControls.dragging) {
+    // 隐式表示（免网格体绘制）不可操作，不显示操作轴
+    if (!this.gizmoEnabled || this.transformControls.dragging || this.activeStage === 'implicit') {
       this._pointerDown = null;
       return;
     }
@@ -616,11 +672,21 @@ export class Viewer {
       -((e.clientY - rect.top) / rect.height) * 2 + 1
     );
     this._selectRaycaster.setFromCamera(ndc, this.camera);
-    const hits = this._selectRaycaster.intersectObjects(this.modelGroup.children, true);
-    const root = this.modelGroup.children[0];
+    // 原模型 / 网格化结果都可挂操作轴（按当前数据流阶段选择目标）
+    const target = this.activeStage === 'mesh' ? this.implicitGroup : this.modelGroup;
+    const hits = this._selectRaycaster.intersectObjects(target.children, true);
+    const root = target.children[0];
     if (hits.length && root) {
       this.transformControls.attach(root);
     }
+  }
+
+  /** 当前可操作的数据对象：网格化结果优先，否则原模型 */
+  _activeTransformRoot() {
+    if (this.activeStage === 'mesh' && this.implicitGroup.children.length) {
+      return this.implicitGroup.children[0];
+    }
+    return this.modelGroup.children[0] || null;
   }
 
   /**
@@ -664,9 +730,9 @@ export class Viewer {
 
   /** 将模型包围盒中心移动到世界原点 (0,0,0) */
   centerModelToOrigin() {
-    const root = this.modelGroup.children[0];
+    const root = this._activeTransformRoot();
     if (!root) return;
-    const box = new THREE.Box3().setFromObject(this.modelGroup);
+    const box = new THREE.Box3().setFromObject(root);
     if (box.isEmpty()) return;
     const center = box.getCenter(new THREE.Vector3());
     if (center.lengthSq() < 1e-12) return; // 已在原点，无需操作
@@ -679,11 +745,12 @@ export class Viewer {
   // 撤销 / 重做（变换操作）
   // =================================================================
 
-  /** 快照当前模型变换状态（位置 / 旋转 / 缩放） */
+  /** 快照当前操作对象变换状态（操作轴附着对象 / 当前数据阶段对象） */
   _snapshotTransform() {
-    const obj = this.modelGroup.children[0];
+    const obj = this.transformControls.object || this._activeTransformRoot();
     if (!obj) return null;
     return {
+      obj,
       position: obj.position.clone(),
       quaternion: obj.quaternion.clone(),
       scale: obj.scale.clone(),
@@ -709,7 +776,7 @@ export class Viewer {
 
   /** 恢复一个变换状态 */
   _applyState(state) {
-    const obj = this.modelGroup.children[0];
+    const obj = (state && state.obj) || this.modelGroup.children[0];
     if (!obj || !state) return;
     obj.position.copy(state.position);
     obj.quaternion.copy(state.quaternion);
@@ -934,6 +1001,8 @@ export class Viewer {
     if (this.transformControls.object) this.transformControls.detach();
     this._undoStack.length = 0;
     this._redoStack.length = 0;
+    // 新模型载入前释放旧的隐式表示
+    this._disposeImplicit();
 
     // CAD 坐标约定：OBJ 通常为 Y-up，绕 X 轴旋转 +90° 使旧 Y 变为新 Z（Z-up）；
     // STL / STEP 本身按 CAD 的 Z-up 约定，不旋转。
@@ -1016,9 +1085,13 @@ export class Viewer {
     this.modelGroup.clear();
     this.modelGroup.add(object);
     this.modelName = name;
+    // 预热 Web Worker 池：首次隐式转换免去创建开销
+    warmSplatWorkers();
 
     // 记录归一化后的实际尺寸（保持真实比例）
     this._updateModelBox();
+    // 自动检测模型封闭性（水密性）：供信息面板显示，并决定隐式转换模式
+    this.modelClosedness = analyzeRootClosedness(this.modelGroup);
 
     // 重置相机与视图
     this.controls.target.copy(this.modelBox.center);
@@ -1059,9 +1132,11 @@ export class Viewer {
     if (name === 'flat') {
       this._applyFlatShading(enabled);
     } else if (name === 'edges') {
-      this.modelGroup.traverse((o) => {
-        if (o.name === 'basiccad-edges') o.visible = enabled;
-      });
+      for (const root of [this.modelGroup, this.implicitGroup]) {
+        root.traverse((o) => {
+          if (o.name === 'basiccad-edges') o.visible = enabled;
+        });
+      }
     } else if (name === 'normal') {
       this._applyNormalShading(enabled);
     } else if (name === 'env') {
@@ -1090,8 +1165,7 @@ export class Viewer {
     const ev = THREE.MathUtils.clamp(Number(this.shadingOptions.envStrength) || 0, 0, 100) / 100;
     // Standard（环境贴图开启时）环境反射参与高光；Phong（默认）仅高光滑块生效
     const specGray = this.shadingOptions.env ? Math.max(sv, ev) : sv;
-    this.modelGroup.traverse((o) => {
-      if (!o.isMesh) return;
+    this._modelMeshes((o) => {
       const materials = Array.isArray(o.material) ? o.material : [o.material];
       for (const m of materials) {
         if (!m) continue;
@@ -1111,13 +1185,13 @@ export class Viewer {
         m.needsUpdate = true;
       }
     });
+    this._syncRayMarchShading();
   }
 
   /** 切换环境贴图着色（开启后材质使用工作室环境反射） */
   _applyEnvShading(enabled) {
     const tex = enabled ? this._envTextures[this.shadingOptions.envType] : null;
-    this.modelGroup.traverse((o) => {
-      if (!o.isMesh) return;
+    this._modelMeshes((o) => {
       if (o.material && o.material.isMeshNormalMaterial) return; // 法线着色时不切换
       // 环境贴图着色开启 → Standard 变体（PBR 环境反射）；关闭 → 默认 Phong 材质
       const std = o.userData.basiccadStandardMaterial;
@@ -1138,6 +1212,7 @@ export class Viewer {
     this._applyFlatShading(this.shadingOptions.flat);
     this._applyMaterialSettings();
     this._applyModelColor();
+    this._syncRayMarchShading();
   }
 
   /** 切换环境贴图类型：studio（工作室）/ outdoor（户外） */
@@ -1148,6 +1223,7 @@ export class Viewer {
     this.scene.background = this._envBgVisible
       ? this._envBackgrounds[type] || null
       : DEFAULT_SCENE_BG.clone();
+    this._syncRayMarchShading();
   }
 
   /** 显示 / 隐藏环境背景（不影响模型着色） */
@@ -1184,8 +1260,7 @@ export class Viewer {
   _applyBackfaceSettings() {
     const color = new THREE.Color(this.shadingOptions.backfaceColor || '#d8d2aa');
     const mix = this.shadingOptions.backfaceMode === 'solid' ? 1 : 0;
-    this.modelGroup.traverse((o) => {
-      if (!o.isMesh) return;
+    this._modelMeshes((o) => {
       for (const variant of [o.userData.basiccadPhongMaterial, o.userData.basiccadStandardMaterial]) {
         const mats = Array.isArray(variant) ? variant : [variant];
         for (const m of mats) {
@@ -1216,6 +1291,7 @@ export class Viewer {
         }
       }
     });
+    this._syncRayMarchShading();
   }
 
   /** 应用模型固有色到材质 */
@@ -1223,8 +1299,7 @@ export class Viewer {
     const color = this.shadingOptions.modelColor
       ? new THREE.Color(this.shadingOptions.modelColor)
       : new THREE.Color(0xffffff);
-    this.modelGroup.traverse((o) => {
-      if (!o.isMesh) return;
+    this._modelMeshes((o) => {
       const materials = Array.isArray(o.material) ? o.material : [o.material];
       for (const m of materials) {
         if (m && 'color' in m) {
@@ -1233,12 +1308,12 @@ export class Viewer {
         }
       }
     });
+    this._syncRayMarchShading();
   }
 
   /** 切换材质平面光照着色（flat shading） */
   _applyFlatShading(enabled) {
-    this.modelGroup.traverse((o) => {
-      if (!o.isMesh) return;
+    this._modelMeshes((o) => {
       const materials = Array.isArray(o.material) ? o.material : [o.material];
       for (const m of materials) {
         if (m && 'flatShading' in m) {
@@ -1261,17 +1336,17 @@ export class Viewer {
         }
       }
     });
-    // 刷新包围盒与模型统计
-    if (this.modelGroup.children.length) {
+    // 刷新包围盒与模型统计（隐式表面显示期间不重复触发加载回调）
+    if (this.modelGroup.children.length && this.activeStage === 'model') {
       this._updateModelBox();
       if (this.onModelLoaded) this.onModelLoaded(this._buildInfo());
     }
+    this._syncRayMarchShading();
   }
 
   /** 切换法线着色（用 MeshNormalMaterial 将法线方向映射为颜色） */
   _applyNormalShading(enabled) {
-    this.modelGroup.traverse((o) => {
-      if (!o.isMesh) return;
+    this._modelMeshes((o) => {
       if (enabled) {
         // 记住原始材质，便于关闭后恢复
         if (!o.userData.basiccadOriginalMaterial) {
@@ -1293,6 +1368,7 @@ export class Viewer {
     this._applyMaterialSettings();
     // 恢复原始材质后重新应用固有色
     this._applyModelColor();
+    this._syncRayMarchShading();
   }
 
   /** 清除当前模型并复位视图 */
@@ -1300,10 +1376,12 @@ export class Viewer {
     if (this.transformControls.object) this.transformControls.detach();
     this._undoStack.length = 0;
     this._redoStack.length = 0;
+    this._disposeImplicit();
     this._disposeModel();
     this.modelGroup.clear();
     this.modelName = '';
     this.modelBox = null;
+    this.modelClosedness = null;
     this.shadingOptions = {
       edges: false,
       flat: false,
@@ -1362,7 +1440,392 @@ export class Viewer {
       name: this.modelName,
       vertices,
       triangles,
+      closedness: this.modelClosedness,
     };
+  }
+
+  // =================================================================
+  // 隐式表示（SDF）
+  // =================================================================
+
+  /**
+   * 遍历当前应显示的模型网格（原始模型 + 隐式表面，按可见性切换）。
+   * 用于让着色选项同时作用于隐式表面。
+   */
+  _modelMeshes(callback) {
+    const roots = [this.modelGroup];
+    // 网格化结果无论是否当前显示，着色选项都同步作用（切回时即正确）
+    if (this.implicitGroup && this.implicitGroup.children.length) roots.push(this.implicitGroup);
+    for (const root of roots) {
+      root.traverse((o) => {
+        if (o.isMesh) callback(o);
+      });
+    }
+  }
+
+  /**
+   * 将当前模型转换为隐式表示（规则网格 SDF），并显示提取出的等值面。
+   * @param {object} [options]
+   * @param {number} [options.resolution=64] SDF 网格分辨率（N³）
+   * @param {number} [options.thickness=0.04] 偏移距离（开放模型，壳体厚度 = 2 × 偏移距离）
+   * @param {number} [options.precision=1] 网格化精度：等值面边长 = 该值 × SDF 格距（1~3）
+   * @param {'auto'|boolean} [options.useWorkers] Web Worker 并行溅射（默认 auto）
+   * @param {(progress:number, phase:string)=>void} [options.onProgress]
+   * @returns {Promise<object|null>} { resolution, bytes, vertices, triangles, mode, thickness, parallel }
+   * 转换后直接进入免网格体绘制显示（不提取网格）；「网格化」或导出时才提取。
+   */
+  async convertToImplicit(options = {}) {
+    const {
+      resolution = 64,
+      thickness = 0.04,
+      precision = 1,
+      useWorkers = 'auto',
+      extractMethod = 'dc',
+      onProgress = null,
+    } = options;
+    this.meshPrecision = THREE.MathUtils.clamp(Number(precision) || 1, 1, 3);
+    this.extractMethod = extractMethod === 'manifold' ? 'manifold' : 'dc';
+    if (!this.modelGroup.children.length) {
+      throw new Error('请先导入模型，再转换为隐式表示');
+    }
+    if (this.transformControls.object) this.transformControls.detach();
+
+    this._disposeImplicit();
+    const token = ++this._convertToken;
+    const controller = new AbortController();
+    this._convertAbort = controller;
+
+    try {
+      if (typeof onProgress === 'function') onProgress(0, 'sampling');
+      const sdf = await meshToSDF(this.modelGroup, {
+        resolution,
+        thickness,
+        useWorkers,
+        // 始终保存最近面法线（Hermite 数据）：提取算法只影响「网格化」，
+        // 与隐式化解耦——切到 DC 网格化时无需重新采样
+        collectNormals: true,
+        onProgress: (p) => {
+          if (typeof onProgress === 'function') onProgress(p, 'sampling');
+        },
+        signal: controller.signal,
+      });
+      if (token !== this._convertToken) return null;
+
+      this.implicitModel = sdf;
+      this.hasImplicit = true;
+      this.hasMesh = false;
+      this.implicitModel.vertices = 0;
+      this.implicitModel.triangles = 0;
+      // 免网格体绘制显示（不提取网格，直到「网格化」/导出时才提取）
+      this._ensureImplicitVolume();
+      this._syncRayMarchShading();
+      this.activeStage = 'implicit';
+      this._applyStageVisibility();
+      if (this.onDataStageChange) this.onDataStageChange('implicit');
+
+      const info = {
+        resolution,
+        bytes: sdf.data.byteLength,
+        vertices: this.implicitModel.vertices || 0,
+        triangles: this.implicitModel.triangles || 0,
+        mode: sdf.mode,
+        thickness: sdf.thickness,
+      };
+      if (this.onImplicitCreated) this.onImplicitCreated(info);
+      return info;
+    } finally {
+      this._convertAbort = null;
+    }
+  }
+
+  /**
+   * 数据流：切换到指定数据阶段显示。
+   * @param {'model'|'implicit'|'mesh'} stage
+   */
+  setActiveStage(stage) {
+    const valid =
+      stage === 'model' ||
+      (stage === 'implicit' && this.hasImplicit) ||
+      (stage === 'mesh' && this.hasMesh);
+    if (!valid) return;
+    this.activeStage = stage;
+    // 切换阶段时解除操作轴附着（避免作用于已隐藏的数据）
+    if (this.transformControls.object) this.transformControls.detach();
+    this._applyStageVisibility();
+    if (this.onDataStageChange) this.onDataStageChange(stage);
+  }
+
+  /** 按当前数据流阶段更新各容器的可见性 */
+  _applyStageVisibility() {
+    this.modelGroup.visible = this.activeStage === 'model';
+    this.implicitGroup.visible = this.activeStage === 'mesh';
+    if (this._implicitVolume) {
+      this._implicitVolume.mesh.visible = this.activeStage === 'implicit';
+    }
+  }
+
+  /**
+   * 网格化：把隐式表示提取为三角网格并显示（数据流进入「网格化」阶段）。
+   * @param {object} [options]
+   * @param {number} [options.precision=this.meshPrecision] 网格化精度（1~3）
+   * @param {(progress:number)=>void} [options.onProgress]
+   * @returns {Promise<object|null>} { resolution, bytes, vertices, triangles, mode, thickness }
+   */
+  async meshifyImplicit(options = {}) {
+    const { precision = this.meshPrecision, onProgress = null } = options;
+    if (!this.implicitModel) {
+      throw new Error('请先转换为隐式表示，再网格化');
+    }
+    this.meshPrecision = THREE.MathUtils.clamp(Number(precision) || 1, 1, 3);
+    if (this._implicitVolume) this._implicitVolume.setPrecision(this.meshPrecision);
+    const token = ++this._extractToken;
+    if (typeof onProgress === 'function') onProgress(0);
+    try {
+      const geometry = await this._extractImplicitGeometry(
+        this.implicitModel,
+        this.meshPrecision
+      );
+      if (token !== this._extractToken) {
+        geometry.dispose();
+        return null;
+      }
+      this._installImplicitMesh(geometry);
+      this.hasMesh = true;
+      this.activeStage = 'mesh';
+      this._applyStageVisibility();
+      if (this.onDataStageChange) this.onDataStageChange('mesh');
+      const info = {
+        resolution: this.implicitModel.resolution,
+        bytes: this.implicitModel.data.byteLength,
+        vertices: this.implicitModel.vertices || 0,
+        triangles: this.implicitModel.triangles || 0,
+        mode: this.implicitModel.mode,
+        thickness: this.implicitModel.thickness,
+      };
+      if (this.onMeshCreated) this.onMeshCreated(info);
+      return info;
+    } catch (err) {
+      console.warn('[basicCAD] 网格化失败：', err);
+      throw err;
+    }
+  }
+
+  /** 按当前精度 / 提取算法从 SDF 提取等值面几何（含碎屑过滤） */
+  async _extractImplicitGeometry(sdf, precision) {
+    let geometry;
+    if (this.extractMethod === 'dc') {
+      // DC：显示精度 → 粗网格步长（0.5~1.4→1 最精细，1.5~2.4→2，2.5~3→3）
+      const step = THREE.MathUtils.clamp(Math.round(precision), 1, 3);
+      geometry = await sdfToDualContourMesh(sdf, { step });
+    } else {
+      // Manifold：等值面目标边长 = 精度值 × SDF 格距（越小越精细）
+      const cellMax = Math.max(sdf.cell.x, sdf.cell.y, sdf.cell.z);
+      geometry = await sdfToThreeMesh(sdf, { edgeLength: precision * cellMax });
+    }
+    // 碎屑过滤：丢弃等值面中极小且孤立的连通分量（点状 / 杆状杂点）
+    return filterSmallComponents(geometry, { minTriangles: 24, minRatio: 0.002 });
+  }
+
+  /** 把提取出的几何安装为半透明双面网格，并同步统计与着色 */
+  _installImplicitMesh(geometry) {
+    // 清理旧的隐式网格
+    this.implicitGroup.traverse((o) => {
+      if (o.geometry) o.geometry.dispose();
+      const mats = Array.isArray(o.material) ? o.material : [o.material];
+      for (const m of mats) if (m) m.dispose();
+    });
+    this.implicitGroup.clear();
+
+    const material = new THREE.MeshStandardMaterial({
+      color: 0x6ea8ff,
+      metalness: 0.15,
+      roughness: 0.32,
+      transparent: true,
+      opacity: 0.9,
+      // 闭合与开放统一半透明双面渲染，表现一致
+      side: THREE.DoubleSide,
+    });
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.name = 'basiccad-implicit-surface';
+    // 网格边叠加层：与原始模型的「显示网格边」一致（三角网格边，可开关）
+    const edges = new THREE.LineSegments(
+      new THREE.EdgesGeometry(geometry, 0),
+      new THREE.LineBasicMaterial({
+        color: 0x111827,
+        transparent: true,
+        opacity: 0.85,
+      })
+    );
+    edges.name = 'basiccad-edges';
+    edges.visible = this.shadingOptions.edges;
+    mesh.add(edges);
+    this.implicitGroup.add(mesh);
+    this.implicitModel.triangles = geometry.index
+      ? geometry.index.count / 3
+      : geometry.attributes.position.count / 3;
+    this.implicitModel.vertices = geometry.attributes.position.count;
+    // 让当前着色选项同步作用于隐式表面
+    this._applyEnvShading(this.shadingOptions.env);
+    this._applyMaterialSettings();
+    this._applyModelColor();
+    this._applyFlatShading(this.shadingOptions.flat);
+    this._applyNormalShading(this.shadingOptions.normal);
+  }
+
+  /** 确保免网格体绘制对象存在（从当前 SDF 上传体纹理） */
+  _ensureImplicitVolume() {
+    if (this._implicitVolume || !this.implicitModel) return;
+    const volume = createImplicitVolume(this.implicitModel, {
+      precision: this.meshPrecision,
+    });
+    this._implicitVolume = volume;
+    this.scene.add(volume.mesh);
+  }
+
+  /** 释放免网格体绘制资源 */
+  _disposeImplicitVolume() {
+    if (!this._implicitVolume) return;
+    this.scene.remove(this._implicitVolume.mesh);
+    this._implicitVolume.dispose();
+    this._implicitVolume = null;
+  }
+
+  /** 生成 1×1 白色等距柱状图，作为环境贴图未加载完成时的兜底 */
+  _fallbackEnvTexture() {
+    if (!this._fallbackEnvTex) {
+      const canvas = document.createElement('canvas');
+      canvas.width = 1;
+      canvas.height = 1;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#c8ccd2';
+      ctx.fillRect(0, 0, 1, 1);
+      this._fallbackEnvTex = new THREE.CanvasTexture(canvas);
+      this._fallbackEnvTex.mapping = THREE.EquirectangularReflectionMapping;
+    }
+    return this._fallbackEnvTex;
+  }
+
+  /** 把当前着色选项同步到免网格体绘制材质 */
+  _syncRayMarchShading() {
+    const volume = this._implicitVolume;
+    if (!volume) return;
+    const s = this.shadingOptions;
+    volume.updateShading({
+      baseColor: new THREE.Color(s.modelColor || '#ffffff'),
+      specular: THREE.MathUtils.clamp(Number(s.specular) || 0, 0, 100) / 100,
+      envStrength: THREE.MathUtils.clamp(Number(s.envStrength) || 0, 0, 100) / 100,
+      envEnabled: !!s.env,
+      envMap: this._envBackgrounds[s.envType] || this._fallbackEnvTexture(),
+      envRotation: this._envRotationMatrix,
+      normalMode: !!s.normal,
+      flatMode: !!s.flat,
+      backfaceSolid: s.backfaceMode !== 'front',
+      backfaceColor: new THREE.Color(s.backfaceColor || '#d8d2aa'),
+    });
+  }
+
+  /**
+   * 导出当前隐式表面网格（所见即所得：跟随当前显示精度 / 提取算法）。
+   * 免网格预览模式下还没有网格，导出时按当前精度补提取一次。
+   * @param {'stl'|'obj'|'stl-ascii'} [format='stl'] 导出格式
+   * @returns {Promise<{ blob: Blob, name: string, vertices: number, triangles: number }>}
+   */
+  async exportImplicitSurface(format = 'stl') {
+    if (!this.implicitModel) {
+      throw new Error('当前没有隐式表面可导出，请先转换为隐式表示');
+    }
+    if (!this.hasMesh) {
+      // 导出时自动网格化（数据流进入「网格化」阶段）
+      await this.meshifyImplicit({ precision: this.meshPrecision });
+    }
+    const mesh = this.implicitGroup.children[0];
+    if (!mesh || !mesh.geometry) throw new Error('网格化失败，无法导出');
+    // 若网格被操作轴移动/旋转/缩放，导出时把变换烘焙进顶点（所见即所得）
+    mesh.updateWorldMatrix(true, false);
+    let geometry = mesh.geometry;
+    if (mesh.matrixWorld && !mesh.matrixWorld.equals(_IDENTITY_MATRIX)) {
+      geometry = geometry.clone();
+      geometry.applyMatrix4(mesh.matrixWorld);
+      if (geometry.attributes.normal) geometry.computeVertexNormals();
+    }
+    const posAttr = geometry.attributes.position;
+    const triangles = geometry.index
+      ? geometry.index.count / 3
+      : posAttr
+        ? posAttr.count / 3
+        : 0;
+    const baseName = (this.modelName || 'implicit').replace(/\.[^.]+$/, '') || 'implicit';
+
+    let blob;
+    let name;
+    if (format === 'obj') {
+      blob = new Blob([geometryToOBJ(geometry, { name: 'basicCAD implicit surface' })], {
+        type: 'text/plain;charset=utf-8',
+      });
+      name = `${baseName}-implicit.obj`;
+    } else if (format === 'stl-ascii') {
+      blob = new Blob([geometryToASCIISTL(geometry, { name: 'basicCAD implicit surface' })], {
+        type: 'text/plain;charset=utf-8',
+      });
+      name = `${baseName}-implicit.stl`;
+    } else {
+      blob = new Blob([geometryToBinarySTL(geometry, { name: 'basicCAD implicit surface' })], {
+        type: 'model/stl',
+      });
+      name = `${baseName}-implicit.stl`;
+    }
+    return { blob, name, vertices: posAttr ? posAttr.count : 0, triangles };
+  }
+
+  /**
+   * 调节网格化精度：等值面提取边长 = 精度值 × SDF 格距（1~3，越小越精细）。
+   * 免网格显示阶段只改光线步进步长（uniform，零重算）；「网格化」时按该精度提取。
+   */
+  setMeshPrecision(precision) {
+    const p = THREE.MathUtils.clamp(Number(precision) || 1, 1, 3);
+    this.meshPrecision = p;
+    // 免网格显示：只改步长，零重算
+    if (this._implicitVolume) {
+      this._implicitVolume.setPrecision(p);
+    }
+  }
+
+  /** 切换等值面提取方式：'dc'（Dual Contouring，保留锐边）或 'manifold'（Manifold level set） */
+  async setExtractMethod(method) {
+    const next = method === 'manifold' ? 'manifold' : 'dc';
+    if (next === this.extractMethod) return;
+    this.extractMethod = next;
+    // 已有网格化结果时立即用新算法重新网格化（SDF 无需重算）
+    if (this.hasMesh) {
+      await this.meshifyImplicit({ precision: this.meshPrecision });
+    }
+  }
+
+  /** 释放隐式表面资源，取消进行中的转换，并恢复原始网格显示 */
+  _disposeImplicit() {
+    this._convertToken++; // 使进行中的转换失效
+    this._extractToken++; // 使进行中的重新提取失效
+    this._disposeImplicitVolume();
+    if (this._convertAbort) {
+      try {
+        this._convertAbort.abort();
+      } catch {
+        /* noop */
+      }
+      this._convertAbort = null;
+    }
+    this.implicitGroup.traverse((o) => {
+      if (o.geometry) o.geometry.dispose();
+      const mats = Array.isArray(o.material) ? o.material : [o.material];
+      for (const m of mats) if (m) m.dispose();
+    });
+    this.implicitGroup.clear();
+    this.implicitModel = null;
+    this.hasImplicit = false;
+    this.hasMesh = false;
+    this.activeStage = 'model';
+    this._applyStageVisibility();
+    if (this.onDataStageChange) this.onDataStageChange('model');
   }
 
   // =================================================================
@@ -1392,6 +1855,7 @@ export class Viewer {
     window.removeEventListener('resize', this._onResize);
     this.renderer.domElement.removeEventListener('pointerdown', this._onCanvasPointerDown);
     this.renderer.domElement.removeEventListener('pointerup', this._onCanvasPointerUp);
+    this._disposeImplicit();
     this._disposeModel();
     if (this.viewCube) this.viewCube.dispose();
     this.transformControls.dispose();

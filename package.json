@@ -10,6 +10,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "manifold-3d": "^3.5.1",
     "occt-import-js": "^0.0.23",
     "three": "^0.185.1",
     "vite": "^8.2.0"

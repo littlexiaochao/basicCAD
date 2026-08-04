@@ -61,6 +61,26 @@ try {
     $('info-vertices').textContent = formatNumber(info.vertices);
     $('info-faces').textContent = formatNumber(info.triangles);
     infoPanel.hidden = false;
+    // 网格封闭性（导入时自动检测）
+    const cd = info.closedness;
+    $('info-closed').textContent = cd
+      ? cd.closed
+        ? '封闭模型'
+        : cd.openEdges > 0
+          ? `开放模型（开放边 ${cd.openEdges}）`
+          : '开放模型'
+      : '—';
+    // 壳体厚度设置：仅开放模型显示
+    $('sdf-thickness-row').hidden = !cd || cd.closed;
+    // 新模型载入：复位隐式表示 UI
+    $('btn-sdf-convert').disabled = false;
+    $('btn-sdf-meshify').disabled = true;
+    hideSdfInfo();
+    syncSdfExportRow();
+    syncDataFlow();
+    // 导入模型后操作流程面板自动展开
+    flowWrap.classList.remove('collapsed');
+    $('flow-toggle').setAttribute('aria-expanded', 'true');
     // STEP 模型默认显示 CAD 原始边界线，同步勾选状态
     $('opt-edges').checked = viewer.shadingOptions.edges;
   };
@@ -86,6 +106,17 @@ try {
     optBackfaceColor.value = '#d8d2aa';
     syncBackfaceUI();
     axisInput.hidden = true;
+    $('info-closed').textContent = '—';
+    $('sdf-thickness-row').hidden = true;
+    // 复位隐式表示 UI
+    $('btn-sdf-convert').disabled = true;
+    $('btn-sdf-meshify').disabled = true;
+    hideSdfInfo();
+    syncSdfExportRow();
+    syncDataFlow();
+    // 清除模型后操作流程面板收纳回右边界
+    flowWrap.classList.add('collapsed');
+    $('flow-toggle').setAttribute('aria-expanded', 'false');
   };
   viewer.onGizmoAxisPress = (axis, mode) => {
     const uniformScale = mode === 'scale' && (axis === 'XYZ' || axis === 'XYZE');
@@ -218,6 +249,207 @@ optBackfaceMode.addEventListener('change', (e) => {
 });
 optBackfaceColor.addEventListener('input', (e) => viewer?.setBackfaceColor(e.target.value));
 syncBackfaceUI();
+
+// ===== 隐式表示（SDF） =====
+const sdfConvertBtn = $('btn-sdf-convert');
+const btnSdfMeshify = $('btn-sdf-meshify');
+const sdfExportRow = $('sdf-export-row');
+const sdfExportFormat = $('sdf-export-format');
+const btnSdfExport = $('btn-sdf-export');
+const gridPrecisionSlider = $('sdf-grid-precision');
+const gridPrecisionVal = $('sdf-grid-precision-val');
+const flowWrap = $('flow-wrap');
+const dataStageBtns = {
+  model: $('data-stage-model'),
+  implicit: $('data-stage-implicit'),
+  mesh: $('data-stage-mesh'),
+};
+
+/** 数据流：按当前数据阶段更新按钮可见性与激活状态（蓝色=当前显示） */
+function syncDataFlow() {
+  if (!viewer) return;
+  // 没有导入模型（或清除后）不显示数据流
+  $('data-flow').hidden = !viewer.modelGroup.children.length;
+  // 操作轴面板：无模型或显示隐式表示（免网格，不可操作）时隐藏
+  $('gizmo-panel').hidden =
+    !viewer.modelGroup.children.length || viewer.activeStage === 'implicit';
+  const stages = {
+    model: true,
+    implicit: !!viewer.hasImplicit,
+    mesh: !!viewer.hasMesh,
+  };
+  for (const [stage, btn] of Object.entries(dataStageBtns)) {
+    btn.hidden = !stages[stage];
+    btn.classList.toggle('active', stages[stage] && viewer.activeStage === stage);
+  }
+}
+
+/** 导出行 / 网格化模块：隐式转换完成后网格化内容恢复正常（未完成时灰色） */
+function syncSdfExportRow() {
+  sdfExportRow.hidden = !viewer || !viewer.implicitModel;
+  $('flow-module-mesh').classList.toggle('inactive', !viewer?.hasImplicit);
+}
+
+// 操作流程面板：点击箭头展开 / 收纳（初始化与清除时收纳，导入模型时自动展开）
+$('flow-toggle').addEventListener('click', () => {
+  const collapsed = flowWrap.classList.toggle('collapsed');
+  $('flow-toggle').setAttribute('aria-expanded', String(!collapsed));
+});
+
+// 隐式化 / 网格化模块：点击标题展开 / 收起内容
+document.querySelectorAll('.flow-module-title[data-target]').forEach((title) => {
+  title.addEventListener('click', () => {
+    const body = document.getElementById(title.dataset.target);
+    if (!body) return;
+    const open = body.hidden;
+    body.hidden = !open;
+    title.classList.toggle('open', open);
+  });
+  title.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      title.click();
+    }
+  });
+});
+
+function hideSdfInfo() {
+  document.querySelectorAll('.sdf-info-row').forEach((el) => {
+    el.hidden = true;
+  });
+}
+
+function showSdfInfo(info) {
+  $('sdf-info-resolution').textContent = `${info.resolution}³`;
+  $('sdf-info-memory').textContent = `${(info.bytes / 1048576).toFixed(2)} MB`;
+  $('sdf-info-vertices').textContent = info.vertices ? formatNumber(info.vertices) : '—';
+  $('sdf-info-triangles').textContent = info.triangles ? formatNumber(info.triangles) : '—';
+  document.querySelectorAll('.sdf-info-row').forEach((el) => {
+    el.hidden = false;
+  });
+}
+
+// 网格化精度滑块（1~3）：免网格预览实时改光线步进步长；「网格化」时按该精度提取
+gridPrecisionSlider.addEventListener('input', (e) => {
+  gridPrecisionVal.textContent = Number(e.target.value).toFixed(1);
+});
+gridPrecisionSlider.addEventListener('change', (e) => {
+  viewer?.setMeshPrecision(Number(e.target.value));
+});
+
+// 偏移距离滑块：壳体厚度 = 2 × 偏移距离
+$('sdf-thickness').addEventListener('input', (e) => {
+  $('sdf-thickness-val').textContent = Number(e.target.value).toFixed(3);
+});
+
+sdfConvertBtn.addEventListener('click', async () => {
+  if (!viewer || !viewer.modelGroup.children.length) {
+    showToast('请先导入模型，再转换为隐式表示');
+    return;
+  }
+  const resolution = Number($('sdf-resolution').value);
+  const thickness = Number($('sdf-thickness').value);
+  const precision = Number(gridPrecisionSlider.value);
+  const extractMethod = $('sdf-method').value;
+  loadingOverlay.hidden = false;
+  try {
+    const info = await viewer.convertToImplicit({
+      resolution,
+      thickness,
+      precision,
+      extractMethod,
+      onProgress: (p, phase) => {
+        loadingText.textContent = `正在转换为隐式表示（${resolution}³）… ${Math.round(p * 100)}%`;
+      },
+    });
+    if (!info) return; // 转换已被取消
+    showSdfInfo(info);
+  } catch (err) {
+    console.error(err);
+    showToast(`隐式转换失败：${err.message}`);
+  } finally {
+    loadingOverlay.hidden = true;
+    loadingText.textContent = '加载中…';
+  }
+});
+
+// 网格化：把隐式表示按当前精度提取为三角网格并显示
+btnSdfMeshify.addEventListener('click', async () => {
+  if (!viewer || !viewer.implicitModel) {
+    showToast('请先转换为隐式表示，再网格化');
+    return;
+  }
+  loadingOverlay.hidden = false;
+  try {
+    const info = await viewer.meshifyImplicit({
+      precision: Number(gridPrecisionSlider.value),
+      onProgress: (p) => {
+        loadingText.textContent = `正在网格化为三角网格（${viewer.extractMethod === 'dc' ? 'Dual Contouring' : 'Manifold'}）… ${Math.round(p * 100)}%`;
+      },
+    });
+    if (!info) return;
+    showSdfInfo(info);
+  } catch (err) {
+    console.error(err);
+    showToast(`网格化失败：${err.message}`);
+  } finally {
+    loadingOverlay.hidden = true;
+    loadingText.textContent = '加载中…';
+  }
+});
+
+// 提取算法切换：已有网格化结果时立即按新算法重新网格化
+$('sdf-method').addEventListener('change', (e) => {
+  const method = e.target.value;
+  viewer?.setExtractMethod(method);
+  if (method === 'manifold') {
+    showToast('已切换到 Manifold 网格提取');
+  } else {
+    showToast('已切换到双轮廓 DC 提取（保留锐边）');
+  }
+});
+
+// 数据流：点击阶段按钮切换当前显示
+dataStageBtns.model.addEventListener('click', () => viewer?.setActiveStage('model'));
+dataStageBtns.implicit.addEventListener('click', () => viewer?.setActiveStage('implicit'));
+dataStageBtns.mesh.addEventListener('click', () => viewer?.setActiveStage('mesh'));
+
+if (viewer) {
+  viewer.onImplicitCreated = (info) => {
+    btnSdfMeshify.disabled = false;
+    showSdfInfo(info);
+    syncSdfExportRow();
+    syncDataFlow();
+  };
+  viewer.onMeshCreated = (info) => {
+    showSdfInfo(info);
+    syncDataFlow();
+  };
+  viewer.onDataStageChange = () => syncDataFlow();
+}
+
+// ===== 导出隐式表面（STL / OBJ） =====
+btnSdfExport.addEventListener('click', async () => {
+  if (!viewer || !viewer.implicitModel) {
+    showToast('请先转换为隐式表示，再导出表面网格');
+    return;
+  }
+  try {
+    const { blob, name, vertices, triangles } = await viewer.exportImplicitSurface(sdfExportFormat.value);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 3000);
+    showToast(`已导出 ${name}（顶点 ${formatNumber(vertices)}，三角面 ${formatNumber(triangles)}）`);
+  } catch (err) {
+    console.error(err);
+    showToast(`导出失败：${err.message}`);
+  }
+});
 
 // ===== 视角复位 =====
 $('btn-view-reset').addEventListener('click', () => viewer?.resetView());

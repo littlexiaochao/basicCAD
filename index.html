@@ -30,7 +30,7 @@
         <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M12 3v12" /><path d="m8 11 4 4 4-4" /><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" />
         </svg>
-        导入模型
+        导入
       </label>
       <input type="file" id="file-input" accept=".obj,.stl,.step,.stp" hidden />
 
@@ -39,7 +39,7 @@
           <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M12 2 2 7l10 5 10-5-10-5Z" /><path d="m2 17 10 5 10-5" /><path d="m2 12 10 5 10-5" />
           </svg>
-          着色模式
+          着色
           <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m6 9 6 6 6-6" /></svg>
         </button>
         <div class="dropdown-menu" id="shading-menu">
@@ -107,10 +107,85 @@
 
     <!-- 3D 视口 -->
     <main class="viewport" id="viewport">
+      <!-- 数据流：显示已生成的数据阶段，点击切换当前显示 -->
+      <div class="data-flow" id="data-flow" hidden title="数据流：点击切换当前显示的数据（蓝色=正在显示）">
+        <button class="data-flow-item active" id="data-stage-model">原模型</button>
+        <button class="data-flow-item" id="data-stage-implicit" hidden>隐式表示</button>
+        <button class="data-flow-item" id="data-stage-mesh" hidden>网格化</button>
+      </div>
+      <!-- 操作流程：隐式化 → 网格化 -->
+      <div class="flow-wrap collapsed" id="flow-wrap">
+        <button class="flow-toggle" id="flow-toggle" title="展开 / 收起操作流程" aria-expanded="false"></button>
+        <aside class="flow-panel" id="flow-panel">
+          <div class="flow-panel-title">操作流程</div>
+          <div class="flow-module" id="flow-module-implicit">
+            <div class="flow-module-title open" data-target="flow-module-implicit-body" role="button" tabindex="0" title="点击展开 / 收起">
+              <span>隐式化</span>
+              <svg class="module-chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m6 9 6 6 6-6" /></svg>
+            </div>
+            <div class="flow-module-body" id="flow-module-implicit-body">
+              <div class="menu-row">
+                <span>分辨率</span>
+                <select id="sdf-resolution" title="SDF 采样网格密度（N³）：越高细节越多，采样耗时越长">
+                  <option value="48">48³</option>
+                  <option value="64" selected>64³</option>
+                  <option value="96">96³</option>
+                  <option value="128">128³</option>
+                  <option value="160">160³</option>
+                  <option value="192">192³</option>
+                  <option value="256">256³</option>
+                </select>
+              </div>
+              <div class="menu-slider" id="sdf-thickness-row" hidden title="偏移距离：开放网格的薄壁向表面两侧各偏移该值，壳体厚度 = 2 × 偏移距离（封闭网格忽略）">
+                <span>偏移距离</span>
+                <input type="range" id="sdf-thickness" min="0.001" max="0.1" step="0.001" value="0.04" />
+                <span class="menu-slider-val" id="sdf-thickness-val">0.040</span>
+              </div>
+              <button id="btn-sdf-convert" class="menu-btn" disabled title="把当前三角网格采样为规则网格 SDF，并直接以免网格体绘制显示（不提取网格）">转换为隐式表示</button>
+            </div>
+          </div>
+          <div class="flow-module inactive" id="flow-module-mesh">
+            <div class="flow-module-title" data-target="flow-module-mesh-body" role="button" tabindex="0" title="点击展开 / 收起">
+              <span>网格化</span>
+              <svg class="module-chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m6 9 6 6 6-6" /></svg>
+            </div>
+            <div class="flow-module-body" id="flow-module-mesh-body" hidden>
+              <div class="menu-row">
+                <span>提取算法</span>
+                <select id="sdf-method" title="只影响「网格化」时的等值面提取：Manifold = Marching Tetrahedra 等值面；双轮廓 DC = Hermite 法线 + QEF，保留锐边、速度快">
+                  <option value="manifold" selected>Manifold 网格</option>
+                  <option value="dc">双轮廓 DC（保留锐边）</option>
+                </select>
+              </div>
+              <div class="menu-slider">
+                <span>网格化精度</span>
+                <input type="range" id="sdf-grid-precision" min="1" max="3" step="0.1" value="1" title="网格化精度 = 提取密度倍数（1~3，越小越精细）；实时影响免网格预览的光线步进步长，点击「网格化」时作为等值面提取密度" />
+                <span class="menu-slider-val" id="sdf-grid-precision-val">1.0</span>
+              </div>
+              <button id="btn-sdf-meshify" class="menu-btn" disabled title="将隐式表示按当前精度提取为三角网格并显示">网格化</button>
+              <div class="menu-row" id="sdf-export-row" hidden title="导出隐式表面网格（跟随网格化精度 / 提取算法；尚未网格化时自动先网格化）">
+                <span>导出格式</span>
+                <select id="sdf-export-format" title="STL 二进制体积小、通用；OBJ 文本含法线；STL 文本可读便于调试">
+                  <option value="stl" selected>STL 二进制</option>
+                  <option value="obj">OBJ</option>
+                  <option value="stl-ascii">STL 文本</option>
+                </select>
+                <button id="btn-sdf-export" class="menu-btn" title="下载隐式表面网格文件">导出</button>
+              </div>
+            </div>
+          </div>
+        </aside>
+      </div>
       <aside class="info-panel" id="info-panel" hidden>
         <div class="info-title">模型信息</div>
         <div class="info-row"><span>顶点数</span><strong id="info-vertices">—</strong></div>
         <div class="info-row"><span>网格面数</span><strong id="info-faces">—</strong></div>
+        <div class="info-row"><span>网格封闭性</span><strong id="info-closed">—</strong></div>
+        <div class="info-divider sdf-info-row" id="sdf-section-header" hidden>隐式表示</div>
+        <div class="info-row sdf-info-row" hidden><span>分辨率</span><strong id="sdf-info-resolution">—</strong></div>
+        <div class="info-row sdf-info-row" hidden><span>内存</span><strong id="sdf-info-memory">—</strong></div>
+        <div class="info-row sdf-info-row" hidden><span>顶点数</span><strong id="sdf-info-vertices">—</strong></div>
+        <div class="info-row sdf-info-row" hidden><span>三角面数</span><strong id="sdf-info-triangles">—</strong></div>
       </aside>
 
       <div class="view-cube" id="view-cube">
@@ -121,12 +196,11 @@
         </div>
       </div>
 
-      <div class="gizmo-panel" id="gizmo-panel">
+      <div class="gizmo-panel" id="gizmo-panel" hidden>
         <button id="btn-gizmo" class="gizmo-toggle" title="点击展开/收起操作轴模式">
           <span>操作轴</span>
           <svg class="chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m6 9 6 6 6-6" /></svg>
         </button>
-        <button id="btn-grid" class="gizmo-toggle active" title="显示/隐藏格线">格线</button>
         <div class="gizmo-modes" id="gizmo-modes" hidden>
           <button class="gizmo-mode-btn active" data-mode="translate">移动</button>
           <button class="gizmo-mode-btn" data-mode="rotate">旋转</button>
@@ -137,6 +211,7 @@
           <span id="axis-input-label">X 轴平移</span>
           <input id="axis-input-value" type="number" step="any" placeholder="数值" />
         </div>
+        <button id="btn-grid" class="gizmo-toggle active" title="显示/隐藏格线">格线</button>
       </div>
 
       <div class="empty-hint" id="empty-hint">点击右上角「导入模型」，或将 OBJ / STL / STEP 文件拖拽到此处</div>
